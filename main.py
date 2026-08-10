@@ -1,5 +1,8 @@
 import discord
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class Client(discord.Client):
     async def on_ready(self):
@@ -26,6 +29,5 @@ intents.members = True
 intents.message_content = True
 intents.presences = True
 
-SECRET_TOKEN = os.getenv('SECRET_ACCESS_TOKEN')
 client = Client(intents=intents)
-client.run(SECRET_TOKEN)
+client.run(os.getenv('SECRET_ACCESS_TOKEN'))
