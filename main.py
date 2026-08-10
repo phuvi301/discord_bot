@@ -43,12 +43,12 @@ YTDL_OPTIONS = {
     'quiet': True,
     'no_warnings': True,
     'default_search': 'ytsearch',
-    'source_address': '0.0.0.0',
+    # 'source_address': '0.0.0.0',
 }
 
 FFMPEG_OPTIONS = {
     'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn',
+    'options': '-vn -loglevel error',
 }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
@@ -88,13 +88,26 @@ def format_duration(seconds):
 
 async def search_yt(query):
     def _extract():
-        info = ytdl.extract_info(query, download=False)
+        # Nếu query không phải là URL, tự động thêm prefix ytsearch
+        search_query = query if query.startswith(('http://', 'https://')) else f"ytsearch:{query}"
+
+        info = ytdl.extract_info(search_query, download=False)
+
         if 'entries' in info and info['entries']:
             info = info['entries'][0]
+
+        # Tìm format audio tốt nhất
+        stream_url = info.get('url')
+        if not stream_url and 'formats' in info:
+            for fmt in info['formats']:
+                if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
+                    stream_url = fmt.get('url')
+                    break
+
         return {
             'title': info.get('title', 'Unknown Title'),
             'webpage_url': info.get('webpage_url', info.get('url', '')),
-            'stream_url': info.get('url'),
+            'stream_url': stream_url,
             'duration': info.get('duration', 0),
             'thumbnail': info.get('thumbnail', '')
         }
