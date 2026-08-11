@@ -1,12 +1,71 @@
+import sys
 import os
 import asyncio
 import aiohttp
+import ctypes
 from dotenv import load_dotenv
+
+# --- Nap Opus truoc khi import discord ---
+# Dung os.scandir() lazy + kiem tra ELF64 de tim libopus dung tren Replit/Nix
+def _is_elf64(path: str) -> bool:
+    """Kiem tra file co phai ELF 64-bit khong."""
+    try:
+        with open(path, 'rb') as f:
+            hdr = f.read(5)
+            return len(hdr) >= 5 and hdr[:4] == b'\x7fELF' and hdr[4] == 2
+    except Exception:
+        return False
+
+def _find_opus_64bit() -> str | None:
+    """Tim libopus.so 64-bit trong /nix/store bang scandir (khong hang)."""
+    candidates = []
+    try:
+        with os.scandir('/nix/store/') as it:
+            for entry in it:
+                if 'libopus' in entry.name and entry.is_dir(follow_symlinks=False):
+                    for fname in ('libopus.so.0', 'libopus.so'):
+                        p = os.path.join(entry.path, 'lib', fname)
+                        if os.path.exists(p):
+                            candidates.append(p)
+    except Exception:
+        pass
+    for p in candidates:
+        if _is_elf64(p):
+            return p
+    return candidates[0] if candidates else None
+
+_opus_path = _find_opus_64bit()
+if _opus_path:
+    try:
+        ctypes.CDLL(_opus_path)
+        print(f"[INFO] Opus pre-loaded: {_opus_path}", flush=True)
+    except Exception as e:
+        print(f"[WARN] Opus pre-load failed: {e}", flush=True)
+        _opus_path = None
+else:
+    print("[WARN] libopus.so not found in /nix/store", flush=True)
+
 import discord
 import yt_dlp
 
-# Load file .env trước khi đọc token
+# --- Load opus vao discord.py ---
+def load_opus_lib():
+    if not _opus_path:
+        print("[WARN] Opus not available", flush=True)
+        return False
+    try:
+        discord.opus.load_opus(_opus_path)
+        print(f"[INFO] discord.opus loaded: {_opus_path}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[WARN] discord.opus.load_opus failed: {e}", flush=True)
+        return False
+
+load_opus_lib()
+
+# Load .env
 load_dotenv()
+
 
 # Cấu hình Bot
 config = {
@@ -32,23 +91,25 @@ GAMES = {
     "fishington.io": "814288819477020702"
 }
 
-# Cấu hình yt-dlp & ffmpeg
+# Cấu hình yt-dlp tối ưu
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
-    'extractflat': False,
     'noplaylist': True,
     'nocheckcertificate': True,
     'ignoreerrors': False,
-    'logtostderr': False,
     'quiet': True,
     'no_warnings': True,
-    'default_search': 'ytsearch',
-    # 'source_address': '0.0.0.0',
+    'default_search': 'auto',
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['mweb', 'ios', 'android', 'web']
+        }
+    }
 }
 
 FFMPEG_OPTIONS = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn -loglevel error',
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 32k -analyzeduration 0 -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"',
+    'options': '-vn -filter:a "volume=0.5" -loglevel error',
 }
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
@@ -88,29 +149,86 @@ def format_duration(seconds):
 
 async def search_yt(query):
     def _extract():
-        # Nếu query không phải là URL, tự động thêm prefix ytsearch
         search_query = query if query.startswith(('http://', 'https://')) else f"ytsearch:{query}"
+        song_title = None
 
-        info = ytdl.extract_info(search_query, download=False)
+        # 1. Thử trích xuất từ YouTube không dùng cookie (tránh bị lỗi 'The page needs to be reloaded')
+        try:
+            info = ytdl.extract_info(search_query, download=False)
+            if 'entries' in info and info['entries']:
+                info = info['entries'][0]
 
-        if 'entries' in info and info['entries']:
-            info = info['entries'][0]
+            song_title = info.get('title')
+            stream_url = info.get('url')
 
-        # Tìm format audio tốt nhất
-        stream_url = info.get('url')
-        if not stream_url and 'formats' in info:
-            for fmt in info['formats']:
-                if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
-                    stream_url = fmt.get('url')
-                    break
+            if not stream_url and 'formats' in info:
+                formats = [f for f in info['formats'] if f.get('acodec') != 'none']
+                if formats:
+                    stream_url = formats[-1].get('url')
 
-        return {
-            'title': info.get('title', 'Unknown Title'),
-            'webpage_url': info.get('webpage_url', info.get('url', '')),
-            'stream_url': stream_url,
-            'duration': info.get('duration', 0),
-            'thumbnail': info.get('thumbnail', '')
+            if stream_url:
+                return {
+                    'title': song_title or 'Unknown Title',
+                    'webpage_url': info.get('webpage_url', info.get('url', '')),
+                    'stream_url': stream_url,
+                    'duration': info.get('duration', 0),
+                    'thumbnail': info.get('thumbnail', '')
+                }
+        except Exception as e:
+            print(f"⚠️ Thử YouTube mặc định thất bại: {e}")
+
+        # 2. Nếu thất bại (ví dụ: video giới hạn độ tuổi) và có cookies.txt, thử sử dụng cookies.txt
+        if os.path.exists('cookies.txt'):
+            try:
+                cookie_opts = {**YTDL_OPTIONS, 'cookiefile': 'cookies.txt'}
+                with yt_dlp.YoutubeDL(cookie_opts) as ytdl_cookie:
+                    info = ytdl_cookie.extract_info(search_query, download=False)
+                    if 'entries' in info and info['entries']:
+                        info = info['entries'][0]
+
+                    song_title = info.get('title')
+                    stream_url = info.get('url')
+
+                    if not stream_url and 'formats' in info:
+                        formats = [f for f in info['formats'] if f.get('acodec') != 'none']
+                        if formats:
+                            stream_url = formats[-1].get('url')
+
+                    if stream_url:
+                        return {
+                            'title': song_title or 'Unknown Title',
+                            'webpage_url': info.get('webpage_url', info.get('url', '')),
+                            'stream_url': stream_url,
+                            'duration': info.get('duration', 0),
+                            'thumbnail': info.get('thumbnail', '')
+                        }
+            except Exception as e:
+                print(f"⚠️ Thử YouTube với cookies.txt thất bại: {e}")
+
+        # 3. Phương án dự phòng (Fallback): Tự động lấy âm thanh từ SoundCloud
+        if not song_title:
+            song_title = query.split('?')[0].split('/')[-1]
+
+        sc_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'default_search': 'scsearch'
         }
+        
+        with yt_dlp.YoutubeDL(sc_opts) as sc_ytdl:
+            sc_info = sc_ytdl.extract_info(f"scsearch:{song_title}", download=False)
+            if 'entries' in sc_info and sc_info['entries']:
+                sc_info = sc_info['entries'][0]
+                return {
+                    'title': f"{sc_info.get('title', 'Unknown Title')} (SoundCloud)",
+                    'webpage_url': sc_info.get('webpage_url', ''),
+                    'stream_url': sc_info.get('url'),
+                    'duration': sc_info.get('duration', 0),
+                    'thumbnail': sc_info.get('thumbnail', '')
+                }
+
+        raise Exception("Không thể trích xuất luồng âm thanh từ bài hát này.")
+
     return await asyncio.to_thread(_extract)
 
 def play_next_song(guild, text_channel):
@@ -128,11 +246,10 @@ def play_next_song(guild, text_channel):
 
     try:
         source = discord.FFmpegPCMAudio(song_info['stream_url'], **FFMPEG_OPTIONS)
-        source = discord.PCMVolumeTransformer(source, volume=0.5)
 
         def after_playing(error):
             if error:
-                print(f"Lỗi phát nhạc: {error}")
+                print(f"Lỗi sau khi phát nhạc: {repr(error)}")
             asyncio.run_coroutine_threadsafe(play_next_song_async(guild, text_channel), client.loop)
 
         voice_client.play(source, after=after_playing)
@@ -149,7 +266,9 @@ def play_next_song(guild, text_channel):
 
         asyncio.run_coroutine_threadsafe(text_channel.send(embed=embed), client.loop)
     except Exception as e:
-        print(f"Lỗi khi phát nhạc: {e}")
+        import traceback
+        print(f"Lỗi khi phát nhạc: {repr(e)}")
+        traceback.print_exc()
         asyncio.run_coroutine_threadsafe(text_channel.send(f"❌ Không thể phát bài hát: {e}"), client.loop)
         play_next_song(guild, text_channel)
 
@@ -397,5 +516,6 @@ class CustomClient(discord.Client):
                 return
 
 # Khởi tạo và chạy client
+print("[INFO] Dang ket noi toi Discord Gateway...", flush=True)
 client = CustomClient(intents=intents)
 client.run(config["token"])
